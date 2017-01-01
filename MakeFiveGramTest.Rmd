@@ -1,0 +1,336 @@
+---
+title: "predicModel"
+author: "boole2"
+date: "December 3, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(tm)
+#library(RWeka)
+library(wordcloud)
+library(proxy)
+library(dplyr)
+library(data.table)
+#library(cluster) 
+library(knitr)
+library(ggplot2)
+library(slam)
+library(parallel)
+library(SnowballC)
+library(stringr)
+library(NLP)
+library(openNLP)
+#library(qdap)
+#install.packages("stringi")
+library(stringi)
+
+
+# install.packages("rJava", type="source")
+# library(rJava)
+#  Sys.getenv('JAVA_HOME')
+#
+#.jinit()
+#.jcall("java/lang/System", "S", "getProperty", "java.runtime.version")
+
+# Calculate the number of cores
+no_cores <- detectCores() - 1
+
+#methods("print")
+```
+
+```{r load.sampled.file, include=FALSE, cache= TRUE, echo= TRUE}
+
+gc()
+setwd("/home/boole2/coursera/CapstonePrj/week2/")
+
+## We load stop words from file.
+stopwords.fromfile <-readLines("stopwords.csv")
+stopwords.fromfile <- unlist( strsplit(stopwords.fromfile, ", "))
+
+stopwords.fromfile <- c(stopwords.fromfile, c("re","lol","rt","ll","don","ve"))
+#print(stopwords.fromfile[1:20])
+
+
+dt.sampled <- readRDS(file="../week6/testset.Rds")
+
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r Sentence.cleanup, cache= TRUE, echo= TRUE}
+convert_text_to_sentences <- function(text, lang = "en") {
+  # Function to compute sentence annotations using the Apache OpenNLP Maxent sentence detector employing the default model for language 'en'. 
+
+  sentence_token_annotator <- openNLP::Maxent_Sent_Token_Annotator(language = lang)
+
+  # Convert text to class String from package NLP
+  
+  text <- NLP::as.String(text)
+
+  # Sentence boundaries in text
+  sentence.boundaries <- NLP::annotate(text, sentence_token_annotator)
+
+  # Extract sentences
+  sentences <- text[sentence.boundaries]
+  s.list <- list(sentences)
+  # return sentences
+  return(s.list)
+}
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, dt.sampled,  convert_text_to_sentences)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+
+
+
+
+###########################################################################
+replace.contraction <-function( text.line){
+ # text.line = "I'm going to my home. is it true? they're stupid and they'll had truble. He didn't understand I don't want go there. they've been so strong once. it's so crasy!"
+  temp <- tolower(text.line)
+  source.particel <- c( "'ll",  "'ve", "'d", "n't", "'s","'m","'re")
+  target.particel <- c(" will"," have", " had", " not", " is", " am", " are")
+  
+    for(i in seq_along(source.particel)) temp <- gsub(source.particel[i], target.particel[i], temp , fixed = TRUE)
+  
+    return(temp)
+  
+}
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  replace.contraction)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+#########Rimouvo gli oggetti sorgente
+proc.time() - ptm
+
+##########rm(dt.sampled, us.blog,us.twitter, us.news)
+rm(doc.claned.text)
+gc()
+
+
+
+
+
+#########################################
+
+clean_line <- function(text.line){
+    # Lowercase
+  ###  temp <- tolower(text.line)
+    #keep only Letter 
+    temp <- stringr::str_replace_all(text.line,"[^a-zA-Z\\s]", " ")
+   
+    # Shrink down to just one white space
+    temp <- stringr::str_replace_all(temp,"[\\s]+", " ")
+   
+    # Removing empty tocken
+    indexes <- which(temp == "" |  temp == " ")
+    if(length(indexes) > 0){
+      temp <- temp[-indexes]
+    } 
+   
+    return(temp)
+}
+
+
+  
+########## Parallel Computation for heavy computation.
+
+#dt.sampled <- dt.sampled[ sample( nrow(dt.sampled), 5000 ,  replace = FALSE), ]
+# Initiate cluster ( we use 7 Core)
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  clean_line)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+#########Rimouvo gli oggetti sorgente
+proc.time() - ptm
+##rm(dt.sampled, us.blog,us.twitter, us.news)
+rm(dt.sampled)
+rm(doc.claned.text)
+gc()
+
+
+#doc.text.all è il master
+
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r funzioni.pre, cache= TRUE, echo= TRUE}
+###############Apply  TAG For Begin and end of a Sentence###############################
+#bigram
+tag_sentence_one <- function(text.line ){
+  return( paste0( paste0("<s> ", stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+#trigram
+
+tag_sentence_two <- function(text.line ){
+  return( paste0( paste0("<s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+#four gram
+
+tag_sentence_tre <- function(text.line ){
+  return( paste0( paste0("<s> <s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+tag_sentence_four <- function(text.line ){
+  return( paste0( paste0("<s> <s> <s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+#######################NGRAM COMPUTATION############################
+#######################################################################
+#names(doc.text.all) <- "text" 
+#dd <- data.frame(pino =   as.character ( doc.text.all[1:10,] ) )
+parallel.Ngrams <-function(testo, n = 2){
+       
+              s <- stringr::str_trim(as.character(testo  ) )
+                x <- strsplit(s, " ", fixed=TRUE)[[1]]
+                y <- vapply(NLP::ngrams(x,  n), paste,"", collapse=" ")
+
+                return(y)
+}
+
+
+
+
+```
+
+
+
+
+
+```{r test.ngram.2start, cache= TRUE, echo= TRUE}
+
+
+
+# ##########################tag_sentence_two  da cambiare in tre se si usa modello con  fifth gram predittore #######
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+
+
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_two)
+
+doc.text.all.fifth  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.fifth,  parallel.Ngrams,5)
+stopCluster(cl)
+proc.time() - ptm
+
+fifth.gram <- data.frame(words = as.character( unlist(las)) )
+
+
+rm(las)
+gc()
+
+
+
+##############################################################
+
+
+``` 
+
+```{r build.fast.fifthgram.test2, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST 5 Gramma##############################################################
+
+# dal bi.gramma prepariamo il df - predecessore.successore.frequenza.
+
+ x2 <- strsplit(as.character( fifth.gram$words )   ," ", fixed=TRUE)
+  cinque.gramma <- data.frame ( predecessor = paste( paste(
+     paste ( unlist ( lapply(x2, `[[`, 1) ), unlist ( lapply(x2, `[[`, 2) ) ), unlist ( lapply(x2, `[[`, 3) ) ),
+     unlist ( lapply(x2, `[[`, 4) ) ) ,
+     successor = unlist ( lapply(x2, `[[`, 5) ),  fifthsgramma =  fifth.gram$words )
+
+
+saveRDS(cinque.gramma, file="../week6/gram_test_2start.Rds")
+
+```
+
+# Tri stop haed
+
+
+```{r test.ngram.3start, cache= TRUE, echo= TRUE}
+
+
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+
+
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_tre)
+
+doc.text.all.fifth  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.fifth,  parallel.Ngrams,5)
+stopCluster(cl)
+proc.time() - ptm
+
+fifth.gram3 <- data.frame(words = as.character( unlist(las)) )
+
+# fifth.gram <- fifth.gram[,.N, by = words]
+# fifth.gram <- fifth.gram[with(fifth.gram, order(-N)),]
+rm(las)
+gc()
+
+
+
+##############################################################
+
+
+``` 
+```{r build.fast.fifthgram.test2, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST 5 Gramma##############################################################
+
+# dal bi.gramma prepariamo il df - predecessore.successore.frequenza.
+
+ x2 <- strsplit( as.character(fifth.gram3$words)," ", fixed=TRUE)
+  cinque.gramma3 <- data.frame ( predecessor = paste( paste(
+     paste ( unlist ( lapply(x2, `[[`, 1) ), unlist ( lapply(x2, `[[`, 2) ) ), unlist ( lapply(x2, `[[`, 3) ) ),
+     unlist ( lapply(x2, `[[`, 4) ) ) ,
+     successor = unlist ( lapply(x2, `[[`, 5) ),  fifthsgramma =  fifth.gram3$words )
+
+
+saveRDS(cinque.gramma3, file="../week6/gram_test_3start.Rds")
+
+```
+
+

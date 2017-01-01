@@ -1,0 +1,1658 @@
+---
+title: "predicModel"
+author: "boole2"
+date: "December 3, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(tm)
+#library(RWeka)
+library(wordcloud)
+library(proxy)
+library(dplyr)
+library(data.table)
+#library(cluster) 
+library(knitr)
+library(ggplot2)
+library(slam)
+library(parallel)
+library(SnowballC)
+library(stringr)
+library(NLP)
+library(openNLP)
+#library(qdap)
+#install.packages("stringi")
+library(stringi)
+
+
+# install.packages("rJava", type="source")
+# library(rJava)
+#  Sys.getenv('JAVA_HOME')
+#
+#.jinit()
+#.jcall("java/lang/System", "S", "getProperty", "java.runtime.version")
+
+# Calculate the number of cores
+no_cores <- detectCores() - 1
+
+#methods("print")
+```
+
+```{r load.sampled.file, include=FALSE, cache= TRUE, echo= TRUE}
+
+gc()
+setwd("/home/boole2/coursera/CapstonePrj/week2/")
+
+## We load stop words from file.
+stopwords.fromfile <-readLines("stopwords.csv")
+stopwords.fromfile <- unlist( strsplit(stopwords.fromfile, ", "))
+
+stopwords.fromfile <- c(stopwords.fromfile, c("re","lol","rt","ll","don","ve"))
+print(stopwords.fromfile[1:20])
+set.seed(1234)
+
+load.text <- function(file.path){
+        con  <- file(file.path, open = "r")
+        text.d <- readLines(con,  warn = TRUE, skipNul = TRUE, encoding = "latin1" )
+        close(con)
+        return(text.d)
+}
+
+
+us.blog.path <- "en_US/en_US.blogs.txt"
+us.twitter.path <- "en_US/en_US.twitter.txt"
+us.news.path <-"en_US/en_US.news.txt" 
+
+ptm <- proc.time()
+us.blog <- load.text(us.blog.path)
+us.twitter <- load.text(us.twitter.path)
+us.news <- load.text(us.news.path)
+proc.time() -ptm
+
+us.blog <- (us.blog[!is.na(us.blog)])
+us.twitter <- (us.twitter[!is.na(us.twitter)])
+us.news <- (us.news[!is.na(us.news)])
+
+
+
+```
+
+
+
+# Senza Weka
+
+
+
+```{r Ngram.Filtered.noweka, cache= TRUE, echo= TRUE}
+
+
+
+
+set.seed(1321)
+## sampling about 1% of the corpus
+ssamply_chunks_rand <- function(x, perc ){
+        chunks <- NA
+        if(  rbinom(1, 1,perc) ) {
+                chunks <- x   
+        }
+        return(chunks)
+        
+} 
+
+
+sample_chuncks <- function(cl,us.blog,us.twitter, us.news, percent = 0.0001){
+
+        d.table.sampled.blog <-  parLapply( cl, as.array(us.blog), ssamply_chunks_rand, percent)
+        temp1 <- data.table(d.table.sampled.blog)
+        names(temp1) <- "lines"
+        residual.line1 <- (as.array(us.blog)[ which( is.na(temp1$lines))])
+        temp1 <- temp1[-which( is.na(temp1$lines) ), ]
+      
+        
+        d.table.sampled.twitter <-  parLapply( cl, as.array(us.twitter), ssamply_chunks_rand, percent)
+        temp2 <- data.table(d.table.sampled.twitter)
+        names(temp2) <- "lines"
+        residual.line2 <- (as.array(us.twitter)[which( is.na(temp2$lines) )])
+        temp2 <- temp2[-which( is.na(temp2$lines) ), ]
+          
+        
+        
+        d.table.sampled.news <-  parLapply( cl, as.array(us.news), ssamply_chunks_rand, percent)
+        temp3 <- data.table(d.table.sampled.news)
+        names(temp3) <- "lines"
+        residual.line3 <- (as.array(us.news)[which( is.na(temp3$lines) )])
+        temp3 <- temp3[-which( is.na(temp3$lines) ), ]
+      
+         
+        dt.sampl <- rbind(temp1, temp2,temp3)
+        array.residual <- c( residual.line1,residual.line2, residual.line3)
+        
+        
+        return(list(dt.sampl,array.residual) )
+        
+}
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+list.sampled <- sample_chuncks(cl,us.blog,us.twitter, us.news, 0.007  )
+stopCluster(cl)
+ proc.time() -ptm
+gc()
+
+dt.sampled <- list.sampled[[1]]
+residual.array <- list.sampled[[2]]
+
+
+```
+
+
+```{r test.set.sampling, cache= TRUE, echo= TRUE}
+
+
+
+
+set.seed(1321)
+## sampling about 1% of the corpus
+ssamply_chunks_rand <- function(x, perc ){
+        chunks <- NA
+        if(  rbinom(1, 1,perc) ) {
+                chunks <- x   
+        }
+        return(chunks)
+        
+} 
+
+
+sample_testset <- function(cl,residual.array, percent = 0.0001){
+
+        d.table.testset <-  parLapply( cl, residual.array, ssamply_chunks_rand, percent)
+        temp.testset <- data.table(d.table.testset)
+        names(temp.testset) <- "lines"
+       
+        temp.testset <- temp.testset[-which( is.na(temp.testset$lines) ), ]
+      
+        
+        return(temp.testset )
+        
+}
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+dt.testset <- sample_testset(cl,residual.array, 0.001  )
+stopCluster(cl)
+ proc.time() -ptm
+gc()
+
+
+saveRDS(dt.testset, file="../week6/testset.Rds")
+
+```
+
+
+
+
+```{r Sentence.cleanup, cache= TRUE, echo= TRUE}
+convert_text_to_sentences <- function(text, lang = "en") {
+  # Function to compute sentence annotations using the Apache OpenNLP Maxent sentence detector employing the default model for language 'en'. 
+
+  sentence_token_annotator <- openNLP::Maxent_Sent_Token_Annotator(language = lang)
+
+  # Convert text to class String from package NLP
+  
+  text <- NLP::as.String(text)
+
+  # Sentence boundaries in text
+  sentence.boundaries <- NLP::annotate(text, sentence_token_annotator)
+
+  # Extract sentences
+  sentences <- text[sentence.boundaries]
+  s.list <- list(sentences)
+  # return sentences
+  return(s.list)
+}
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, dt.sampled,  convert_text_to_sentences)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+
+# z <- dt.sampled %>% 
+#   gsub(" +", " ", .) %>% 
+# 
+#   strsplit(split = "[\\.:;?!] ")
+# 
+#   gsub(" [^ ]*$", " ", .) %>%
+# 
+# dss <- data.frame(unlist(z))
+#   
+
+
+#   library(qdap)
+# with(sentSplit(tm_corpus2df(current.corpus), "text"), df2tm_corpus(tot, text))
+
+
+
+
+# current.corpus <- Corpus(VectorSource(dt.sampled))
+# # A corpus with 3 text documents
+# #install.packages("qdap")
+# ## reshape the corpus into sentences (modify this function if you want to keep meta data)
+# corp <- tm_map(current.corpus, sent_detect)
+# #inspect(corp)
+# #ucorp <- unlist(corp[[1]])
+# dt.sampled <- data.frame(unlist(corp[[1]]))
+
+
+
+###########################################################################
+replace.contraction <-function( text.line){
+ # text.line = "I'm going to my home. is it true? they're stupid and they'll had truble. He didn't understand I don't want go there. they've been so strong once. it's so crasy!"
+  temp <- tolower(text.line)
+  source.particel <- c( "'ll",  "'ve", "'d", "n't", "'s","'m","'re")
+  target.particel <- c(" will"," have", " had", " not", " is", " am", " are")
+  
+    for(i in seq_along(source.particel)) temp <- gsub(source.particel[i], target.particel[i], temp , fixed = TRUE)
+  
+    return(temp)
+  
+}
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  replace.contraction)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+#########Rimouvo gli oggetti sorgente
+proc.time() - ptm
+
+##########rm(dt.sampled, us.blog,us.twitter, us.news)
+rm(doc.claned.text)
+gc()
+
+
+
+
+
+#########################################
+
+clean_line <- function(text.line){
+    # Lowercase
+  ###  temp <- tolower(text.line)
+    #keep only Letter 
+    temp <- stringr::str_replace_all(text.line,"[^a-zA-Z\\s]", " ")
+   
+    # Shrink down to just one white space
+    temp <- stringr::str_replace_all(temp,"[\\s]+", " ")
+   
+    # Removing empty tocken
+    indexes <- which(temp == "" |  temp == " ")
+    if(length(indexes) > 0){
+      temp <- temp[-indexes]
+    } 
+   
+    return(temp)
+}
+
+
+  
+########## Parallel Computation for heavy computation.
+
+#dt.sampled <- dt.sampled[ sample( nrow(dt.sampled), 5000 ,  replace = FALSE), ]
+# Initiate cluster ( we use 7 Core)
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  clean_line)
+doc.text.all  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+#########Rimouvo gli oggetti sorgente
+proc.time() - ptm
+##rm(dt.sampled, us.blog,us.twitter, us.news)
+rm(dt.sampled)
+rm(doc.claned.text)
+gc()
+
+
+#doc.text.all è il master
+
+```
+
+
+
+
+```{r word.count, cache= TRUE, echo= TRUE}
+########################################################################
+####################Unigram
+################################Word Count segment.
+
+process_line <- function(text.line){
+    # Lowercase
+   # temp <- tolower(text.line)
+    #keep only Letter 
+    #temp <- stringr::str_replace_all(temp,"[^a-zA-Z\\s]", " ")
+   
+    # Shrink down to just one white space
+    #temp <- stringr::str_replace_all(temp,"[\\s]+", " ")
+    # Split word by white space
+    temp <- stringr::str_split(text.line, " ")[[1]]
+    # Removing empty tocken
+    indexes <- which(temp == "")
+    if(length(indexes) > 0){
+      temp <- temp[-indexes]
+    } 
+   
+    return(temp)
+}
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+#uso qui il doc.text.all con tutte le frasi normalzzate
+list.claned.text <- parRapply(cl, doc.text.all,  process_line)
+claned.text.all  <- unlist(list.claned.text )
+stopCluster(cl)
+proc.time() - ptm
+# end parallel computation
+
+d.table.3 <- data.frame(words = claned.text.all)
+names(d.table.3) <- c("words")
+
+N <- nrow(d.table.3)
+V <- nrow( unique(d.table.3) )
+vocabolario = unique(d.table.3)
+
+d.table.3.withstop <- data.table(d.table.3)
+d.table.4.withstop <- d.table.3.withstop[,.N, by = words]
+d.table.4.withstop<- d.table.4.withstop[with(d.table.4.withstop, order(-N)),]
+
+#write.csv(d.table.4.withstop, file= "uni_gram.csv",row.names=FALSE )
+
+k = 2
+word.k.freq <- d.table.4.withstop[d.table.4.withstop$N < k , ]
+word.k.freq.vect <- as.character( as.array( word.k.freq$words))
+
+N1 <- nrow(word.k.freq)
+oov <- (N1/N)
+```
+
+
+```{r vocabolario.pruning, cache= TRUE, echo= TRUE}
+#############RIDUZUZIONE DEL VOCABOLARIO SOSTITUENDO WORD Freq = K###################
+# il gsub( <UNK>) va fatto nella struttura originale  doc.text.all
+
+perc.cut <- 0.3
+word.cut  <- sample(matrix(word.k.freq.vect, ncol =1) , length(word.k.freq.vect)*perc.cut )
+length(word.cut)
+
+purge.vocabolary <-function( text.line, word.cut.off){
+ # text.line <- "il giorno si  misura dal mattino e dal pomeriggio"
+  #word.cut.off <- as.array(c("mattino","pomeriggio"))
+
+    for(i in seq_along(word.cut.off)){
+            word.pattern <- paste0 ( paste0("\\b",word.cut.off[i]), "\\b")
+            text.line <- gsub(word.pattern, "<UNK>", text.line , fixed = FALSE)
+    }
+    return(text.line)
+
+}
+
+
+#word <- as.character( word.k.freq.vect[1:20])
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  purge.vocabolary, word.cut)
+doc.text.all.unk  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+#########Rimouvo gli oggetti sorgente
+proc.time() - ptm
+
+rm(doc.claned.text)
+gc()
+
+
+##############Equivalente#####################################
+# corp <- Corpus(VectorSource(doc.text.all))
+#  tran <- c("<UNK>")
+# corp <- tm_map(corp, function(x) stri_replace_all_fixed(x, word.k.freq.vect, tran, vectorize_all = FALSE))
+# inspect(corp)
+doc.text.all.bck <- doc.text.all
+doc.text.all <- doc.text.all.unk
+
+
+```
+
+
+
+
+```{r funzioni.pre, cache= TRUE, echo= TRUE}
+###############Apply  TAG For Begin and end of a Sentence###############################
+#bigram
+tag_sentence_one <- function(text.line ){
+  return( paste0( paste0("<s> ", stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+#trigram
+
+tag_sentence_two <- function(text.line ){
+  return( paste0( paste0("<s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+#four gram
+
+tag_sentence_tre <- function(text.line ){
+  return( paste0( paste0("<s> <s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+tag_sentence_four <- function(text.line ){
+  return( paste0( paste0("<s> <s> <s> <s> ",  stringr::str_trim(as.character(text.line) )), " </s>") )
+}
+
+#######################NGRAM COMPUTATION############################
+#######################################################################
+#names(doc.text.all) <- "text" 
+#dd <- data.frame(pino =   as.character ( doc.text.all[1:10,] ) )
+parallel.Ngrams <-function(testo, n = 2){
+       
+              s <- stringr::str_trim(as.character(testo  ) )
+                x <- strsplit(s, " ", fixed=TRUE)[[1]]
+                y <- vapply(NLP::ngrams(x,  n), paste,"", collapse=" ")
+
+                return(y)
+}
+
+
+
+
+```
+
+
+```{r calcolo.ngram, cache= TRUE, echo= TRUE}
+
+###########################BI GRAM##########################
+
+## Nota il tagging dipende gagli n.gram che si calcoloano.
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_one)
+doc.text.all.biag  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.biag,  parallel.Ngrams,2)
+stopCluster(cl)
+proc.time() - ptm
+
+bi.gram <- data.table(words = as.character( unlist(las)) )
+bi.gram <- bi.gram[,.N, by = words]
+bi.gram<- bi.gram[with(bi.gram, order(-N)),]
+rm(las)
+gc()
+#write.csv(bi.gram, file= "bi_gram.csv",row.names=FALSE )
+##############################################################
+
+
+
+########################TRI GRAM#########################
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_two)
+doc.text.all.tri  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.tri,  parallel.Ngrams, 3)
+stopCluster(cl)
+proc.time() - ptm
+
+tri.gram <- data.table(words = as.character( unlist(las)) )
+tri.gram <- tri.gram[,.N, by = words]
+tri.gram<- tri.gram[with(tri.gram, order(-N)),]
+rm(las)
+gc()
+#write.csv(tri.gram, file= "tri_gram2.csv",row.names=FALSE )
+##########################################################
+
+###########################Four GRAM##########################
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_tre)
+doc.text.all.four  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.four,  parallel.Ngrams,4)
+stopCluster(cl)
+proc.time() - ptm
+
+four.gram <- data.table(words = as.character( unlist(las)) )
+four.gram <- four.gram[,.N, by = words]
+four.gram <- four.gram[with(four.gram, order(-N)),]
+rm(las)
+gc()
+#write.csv(four.gram, file= "four_gram.csv",row.names=FALSE )
+##############################################################
+
+# ###########################Fifth GRAM##########################
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+doc.claned.text <- parRapply(cl, doc.text.all,  tag_sentence_four)
+doc.text.all.fifth  <- data.frame( pino = as.character ( unlist(doc.claned.text ) ) )
+stopCluster(cl)
+
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+las <- parRapply(cl, doc.text.all.fifth,  parallel.Ngrams,5)
+stopCluster(cl)
+proc.time() - ptm
+
+fifth.gram <- data.table(words = as.character( unlist(las)) )
+fifth.gram <- fifth.gram[,.N, by = words]
+fifth.gram <- fifth.gram[with(fifth.gram, order(-N)),]
+rm(las)
+gc()
+# write.csv(fifth.gram, file= "fifth_gram.csv",row.names=FALSE )
+##############################################################
+
+
+
+
+
+####################Unigram
+################################Word Count segment.
+
+tockenize_line <- function(text.line){
+    
+    temp <- stringr::str_split(text.line, " ")[[1]]
+    # Removing empty tocken
+    indexes <- which(temp == "")
+    if(length(indexes) > 0){
+      temp <- temp[-indexes]
+    } 
+   
+    return(temp)
+}
+
+############################ATTENZIONE - UTILIZZO come sorgente############################
+################################## il doc.text.all.biag che contiene i tocken <s> </s>
+ptm <- proc.time()
+cl <- makeCluster(no_cores)
+list.claned.text <- parRapply(cl, doc.text.all.biag,  tockenize_line)
+claned.text.all  <- unlist(list.claned.text )
+stopCluster(cl)
+proc.time() - ptm
+# end parallel computation
+
+d.table.3 <- data.frame(words = claned.text.all)
+names(d.table.3) <- c("words")
+
+N <- nrow(d.table.3)
+N.token <- N
+V <- nrow( unique(d.table.3) )
+vocabolario = unique(d.table.3)
+
+d.table.3.withstop <- data.table(d.table.3)
+d.table.4.withstop <- d.table.3.withstop[,.N, by = words]
+d.table.4.withstop<- d.table.4.withstop[with(d.table.4.withstop, order(-N)),]
+
+#write.csv(d.table.4.withstop, file= "uni_gram.csv",row.names=FALSE )
+
+#dd <- d.table.4.withstop[1:50, ]
+##################################
+
+
+
+``` 
+
+
+
+
+
+# Build the model
+
+Calcolo frequenze singole parole.  vettore ordinato (con nome) per frequenza
+calcolo bigram - vettore ordinato. 
+caloclo totale  tocken e unique totale vocabolario.
+costruisco 1 matrix - A per ogni elemento del vettore unigram, creo una riga (dovrebbe essre lunga 
+come l'intero vocabolario ok .... per ogni combinazione riga + colonna cerco nel biagram:
+se lo trovo calcolo la probabilità condizionata come likeliohoo del rapporto (biafram freq/ unigram fre)+ soomting laplaciano  se no solo smooting ---- riempo quindi la matrice nxn 
+
+analgoamente creo la tabella per B biagram vs triagram. prendo il vettore dei ho biagram e per ogni termine del vocabolario in colonna costruisco la matrice mxn... 
+
+analogamente per triagram vs quadigram C - prendo il vettore dei triaframm k e per ogni termine del vocabolario in colonna costruisco la matrice kxn...
+analogamente per triagram vs quadigram D - prendo il vettore dei triaframm k e per ogni termine del vocabolario in colonna costruisco la matrice kxn...
+
+A run time - se ho un tri parole faccio una funzione di look up  nel triagram- se lo trovo prendo la riga, ordino i vettore estratto per la probabilità e prendo la parola più probabile.
+
+Se non lo trovo (manca l'indice) back off, lo riduco a un biagram e cerco nella matrice B...
+per applicare lo stupid backoff dovrei mettere una soglia di densità di probabilità (se non supero la soglia, pur trovando la colonna ma tutti sono <  di ksoglia allora c'è troppa incertezza e uso il back off recuperando questa probabiltà  (1-beta, oppure sommatoria dei residui sotto k ) e riportandola sotto di un livello....oppure * 0.4 )
+
+
+# Kneser Nay
+
+## Biagramma  With Discount (fixed)
+
+```{r build.fast.matrici.ngram.discaunted, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST Biagramma##############################################################
+# metodo- chiamo apply sull'indice i dell'unigramma. (bigramma, trigramma etc. per le funzioni successive) 
+# ogni funzione processa quindi una riga della matrice. l'indice è sempre n-gramma predecessore (wi-1, wi-2), (predittore)
+# mentre la colonna è wi, la parola da predirre.
+#dato quindi wi-1  (da uni.gram[i]$word) ricavo le word di outcame dal biagramma (successor) e itero con un for su tutte le 
+# occorrenze dei biagrammi che hanno come predittore (predecessore) la uni.gram[i]$word.
+# analogamente per il trigramma. l'indice i dell'apply itera sul bi.gram da cui, per ogni riga (quindi ogni bigramma) 
+# predittore trovo gli outcame dai trigrammi che hanno come predittore quel bigramma.
+
+
+# dal bi.gramma prepariamo il df - predecessore.succesore.frequenza.
+ x2 <- strsplit(bi.gram$words, " ", fixed=TRUE)
+  bi.gramma <- data.frame ( predecessor = unlist ( lapply(x2, `[[`, 1) ), successor = unlist ( lapply(x2, `[[`, 2) ),  biagrams =  bi.gram$words, freq = bi.gram$N )
+
+
+
+```
+
+## Trigramma Matrice
+
+```{r build.fast.matrici.trigram.discaunted, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST Biagramma##############################################################
+
+# dal bi.gramma prepariamo il df - predecessore.successore.frequenza.
+# ok 
+
+ x2 <- strsplit(tri.gram$words," ", fixed=TRUE)
+  tri.gramma <- data.frame ( predecessor = paste ( unlist ( lapply(x2, `[[`, 1) ), unlist ( lapply(x2, `[[`, 2) ) ), successor = unlist ( lapply(x2, `[[`, 3) ),  trigramma =  tri.gram$words, freq = tri.gram$N )
+
+  
+
+
+```
+
+
+## Quadrigramma Matrice
+
+```{r build.fast.matrici.fourgram.discaunted, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST Biagramma##############################################################
+
+# dal bi.gramma prepariamo il df - predecessore.successore.frequenza.
+
+ x2 <- strsplit(four.gram$words," ", fixed=TRUE)
+  quattro.gramma <- data.frame ( predecessor = paste(
+     paste ( unlist ( lapply(x2, `[[`, 1) ), unlist ( lapply(x2, `[[`, 2) ) ), unlist ( lapply(x2, `[[`, 3) ) )  , 
+     successor = unlist ( lapply(x2, `[[`, 4) ),  foursgramma =  four.gram$words, freq = four.gram$N )
+
+  
+```
+
+## Penta Matrix
+
+
+```{r build.fast.matrici.fifthgram.discaunted, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST 5 Gramma##############################################################
+
+# dal bi.gramma prepariamo il df - predecessore.successore.frequenza.
+
+ x2 <- strsplit(fifth.gram$words," ", fixed=TRUE)
+  cinque.gramma <- data.frame ( predecessor = paste( paste(
+     paste ( unlist ( lapply(x2, `[[`, 1) ), unlist ( lapply(x2, `[[`, 2) ) ), unlist ( lapply(x2, `[[`, 3) ) ),
+     unlist ( lapply(x2, `[[`, 4) ) ) ,
+     successor = unlist ( lapply(x2, `[[`, 5) ),  fifthsgramma =  fifth.gram$words, freq = fifth.gram$N )
+
+
+
+
+```
+
+
+## pulizia intermedia
+
+
+```{r clean.up, cache= TRUE, echo= TRUE}
+
+rm( d.table.3)
+
+rm( d.table.3.withstop) 
+rm(doc.text.all.four)
+rm(doc.text.all.fifth)
+
+rm(doc.claned.text)
+rm(claned.text.all)
+rm(x2)
+rm(us.news)
+ rm(us.blog)
+  rm(us.twitter)
+   
+gc()
+
+```
+
+
+# Matrice continuazione per Biagramma
+
+```{r build.fast.matrici.bigramma.continuazione, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST Biagramma##############################################################
+# metodo- chiamo apply sull'indice i dell'unigramma che funge da predecessore (wi-2) per il bigramma succesore (wi-1, wi).  (sempre anche per trigrammi, in tal caso è wi-3  che precede il trigramma successore: wi-2,wi-1,wi )
+
+# ogni funzione processa quindi una riga della matrice. l'indice è sempre l'unigramma predecessore  del biagramma sfasato in avanti (wi-1, wi) ..  partendo dal trigramma  bisgna quindi splittare in wi-2    e in (wi-1,wi).
+#iterando quindi su (table4.... tipo vocabolario)  questo viene fatto matchare con wi-2 come predecessore del bigramma restante (wi-1,wi) si rieme quindi la cella dell'array ordinato nella dimensione wi-1,wi (del biagramma restante). Questa dimensione va ricavata come unique( sub.split ) dello Split del triagramma, ovvero nei biagrammi unici restanti dallo split del trigramma.
+# questa steso vettore di caratteri con i biagrammi (wi-1,wi) va passata anche al build della matrice come names(....) <- unique(biagramma.residuo)
+
+
+# dal bi.gramma prepariamo il df - predecessore.succesore.frequenza.
+ x2 <- strsplit(tri.gram$words, " ", fixed=TRUE)
+  bi.gramma.residuo <- data.frame ( predecessor = unlist ( lapply(x2, `[[`, 1) ), successor =paste( unlist ( lapply(x2, `[[`, 2) ), unlist ( lapply(x2, `[[`, 3) ) ),  trigrams =  tri.gram$words, freq = tri.gram$N )
+
+
+
+```
+
+
+
+<!-- ## pulizia intermedia 2 -->
+
+
+<!-- ```{r clean.up.2, cache= TRUE, echo= TRUE} -->
+
+
+<!-- rm(dfs) -->
+<!-- rm(list.bia.target) -->
+<!-- rm(list.claned.text) -->
+<!-- rm(list.tria.target) -->
+<!-- rm(list.bia.continuation) -->
+<!-- gc() -->
+
+
+<!-- ``` -->
+
+# Matrice Continuzaizone Triagramma
+
+
+```{r build.fast.matrici.trigramma.continuazione, cache= TRUE, echo= TRUE}
+
+
+
+################################VERSIONE FAST Biagramma##############################################################
+# metodo- chiamo apply sull'indice i dell'unigramma che funge da predecessore (wi-2) per il bigramma succesore (wi-1, wi). 
+
+
+# dal bi.gramma prepariamo il df - predecessore.succesore.frequenza.
+ x2 <- strsplit(four.gram$words, " ", fixed=TRUE)
+  tri.gramma.residuo <- data.frame ( predecessor = unlist ( lapply(x2, `[[`, 1) ), successor = paste( 
+    paste( unlist ( lapply(x2, `[[`, 2) ), unlist ( lapply(x2, `[[`, 3) ) ),  unlist ( lapply(x2, `[[`, 4) ) )  ,  trigrams =  four.gram$words, freq = four.gram$N )
+
+
+```
+
+
+
+## Kneiser Ney  Triagram Interpolation  for prediction wi  based on Biagram table
+Costruiamo il data.frame finale (da serializzare su disco con ff).
+Usiamo una catena markoviana - biagramma - unigramma wi (ma che deve essere letta come wi-2,wi-1 transisce in wi-1,wi)
+
+Prima colonna il biagramma predittore (wi-2,wi-1), seconda colonna la probabilità di transizione Pkn(wi) calcolata con 
+l'interpolazione di Kneiser Ney, terza colonna la wi target della transizione.   I predittori possono essere duplicati.
+In fase di runtime, l'algoritmo deve scorrere con un puntatore di frase nella posizione w0 (cioè fra la parola da predirre e le utime due parole wi-2,wi-1 già editate) e fare una lookup sulla colonna dei predittori:
+Se trova 1 o più occorrenze del biagramma predittore -  estrae il subset e ordina per Pkn maggiri e taglia max 3 parole più probabili.
+Se non trova il biagramma predittore, 1: o degrada il Modello a N-1 Ordine (cioè alla tabella biagramma, con unigramma predittore) a un biagramma tipo back off? oppure  ->  inseriesce  <UKN> al posto di wi-2 in modo da ripetere la look up con <UKN> wi-1.  Possible ancora (ma meno ottimale) anche  wi-2 <UKN> ma in tal caso meglio degradare a N-1 Model (? testare)
+
+Nota del modello vanno tolte tutte le Pkn(<UKN>), Pkn(<s>) mentre  Pkn(</s>) puo avere senso per predirre la fine della frase (e proporre quindi il .)
+
+
+Per il calcol de df.kney.model.trigram  - prendiamo il data.frame gia splittato del tri.gram cioè tri.gramma.
+
+per ogni predittore (predecessore) non unico e per ogni wi outcome calcoliamo Pkn(wi) costruendo il df.target (come lista di due liste - [ [1]]  char predittore (wi-2,wi-1) e [[2]]  con [1] Pkn e [2] la wi target 
+<wi-2,wi-1> 
+
+
+
+## Bigramma Kneser Ney
+
+```{r fast.bigram.kneiser.ney.fix.D, cache= TRUE, echo= TRUE}
+
+### Ricalcoliamo qui l'unigramma e il bigramma e il trigramma e il four.gramma con il Discount 
+## (va calcolato il discount per ogni tipo di N-gramma.... o fisso (1=0.5,2=0.5,3=0.75..), o con la formuala dei tedeschi n1/n1+n2...).. da queste matrici si possono ricavare:
+# dal unigramma in colonna i Count Continuation e la Pkn (colonne sum e righe sum.. tutte per la normlaizzazione... questo solo una volta). dal unigramma, bigramma  le lambda (in sum in riga..).
+# la matrice del trigramma va bene così (per interpolazione - tri, bi, uni): a questo punto esplodendo:
+# Pkn(trigramma) = max( PMLN(wi|wi-1,wi-2) -discounted(wi,wi-1,wi-2) ) + d/count_bia(wi-1,wi-2) * C(wi-i,wi-2 *)  * Pkn(bia)
+# attenzione che  count_bia(wi-1,wi-2)  vuol dire per la frase "the tollest biliding" -> "wi-2, wi-2, wi"  quindi cont_bia("the tollest")  e non cont("tollest bilding") cosi anche C(wi-i,wi-2 *) è
+# C("the tollest *")   calcolato via biagramma rowsum >0  e il count_bia con la lookup della frequenza del biagramma "the tollest"
+## Proseguiamo con Pkn(biagramma) = max( Ckn( *wi,wi-1 )/CKn(*wi-i) -  discount(wi,wi-1)) + d/c(wi-1)  * C(wi-1*) * Pkn(wi)
+## Dove Ckn(*"tollest building" / Ckn(*"tollest"")) ricavata dalla matrice di continazione (biagramma.continuazione in colonna per il biagramma, e unigramma in sum colonna ). 
+## C(wi-1*) calcolabile dal unigramma ma in riga: sumrow(wi-1)> 0,  c(wi-1) e la frequenza del unigramma, diretto. 
+## Pkn(wi) = Ckn(*wi)/ V +  N1*percentuale_UKN (0.2)/V
+## dove Ckn(*wi)  ricavabile dal unigramma sommando in colonna > 0. V  è l'intero vocabolario.
+
+
+v.discount.large <- c(0.5, 0.5, rep(0.75, 1000) )
+
+# index per il biagramma è wi-1 estratto dal bi.gramma$ predecessore unique.
+
+
+process_kneiser_inter_bia_fast_D <- function(i, w1i.df, bi.gramma,  uni.gram,v.discount,  V, bi.gramma.residuo ){ 
+  
+  
+  
+  
+  A.list = list()
+  ## prendo l'indice dalla riga vettore = a row del df. trigramma
+   wi1 <- as.character( w1i.df[i])
+   if(  runif(1) > 0.95 ) {
+     message(paste("pointer = ",i ) )
+     message(paste("wi1 = ", wi1 ) )
+     flush.console()
+   }
+ 
+  
+  list.of.predittori <- bi.gramma[ bi.gramma$predecessor == wi1,  ]
+  C.continuation.wi1.p <-  nrow( list.of.predittori) 
+  
+  c.wi1.gram <- uni.gram[uni.gram$words == wi1, ]$N
+  
+  # Per ogni tupla (tri.gramma) wi2wi1wi  dove wi cambia ad ogni ciclo calcolo le probabilità (come assembato di array nella lista di ritorno)
+  # Nota D è qui fissato all'ordine più alto non nullo del modello - quindi D(tri.gramma) che cambia ad ogni ciclo wi2wi1 +(wi) 
+  
+  if( C.continuation.wi1.p  >0){
+    
+    for(i in 1:nrow(list.of.predittori)){
+          
+      A.row <- array(data = c(wi1, "0","null"), dim =3)
+      wi <-  as.character(  list.of.predittori[i,]$successor)
+      A.row[1] <-  wi1
+      A.row[3] <- wi
+      
+      wi1wi.freq <- list.of.predittori[i,]$freq
+      
+      D <- v.discount[wi1wi.freq +1] 
+      
+      smooted.wi1wi <- wi1wi.freq -   D     
+      
+      P.MLE.wiwi1.dis <-   smooted.wi1wi / c.wi1.gram
+      ### lambda 
+      
+      lambda_wi1 <- ( D/c.wi1.gram )*C.continuation.wi1.p
+        #uso il bia.gramma splittato wi1   wi  ma considerando qui wi <- wi1 
+        # quindi si filtra su successore considerando wi == wi1 
+        # nrow riporta Ckn.p.wi1 
+        Ckn.p.wi <- nrow( bi.gramma[bi.gramma$successor == wi,  ])
+     
+      ## Pkn(wi)
+      Pkn.wi <- (Ckn.p.wi/V)
+      
+       if( wi == "<UNK>") Pkn.wi <- 0.0001/V # riduco a epsilon la probabilità del unigramma Dummy
+      
+      Pkn.wi1.wi.d <- P.MLE.wiwi1.dis + lambda_wi1 * Pkn.wi
+      
+      A.row[2] <- as.character( Pkn.wi1.wi.d)
+      
+                        
+      A.list[[i]] <-A.row
+     
+    }
+  }else{
+    
+    A.row <- array(data = c(wi1, "0","null"), dim =3)
+    A.list[[1]] <-A.row
+  }
+  
+  
+  
+  return(A.list)
+}
+
+
+
+
+bi.gram$N <- as.numeric(bi.gram$N)
+
+chunk <- bi.gramma %>% group_by(predecessor) %>% summarize( count = n())
+chunk<- chunk[with(chunk, order(-count)),] 
+ 
+w1i.df <-  as.array( chunk$predecessor)
+#names(w1i.df) <- c("index")
+pointer  <-  as.array(1:length(w1i.df))
+# non togliamo la <s> iniziale per poter predirre l'inizio frase
+# w1i.df <- as.data.frame ( w1i.df[ which( w1i.df$index != c("<s>") ) , ])
+# names(w1i.df) <- c("index")
+
+ptm <- proc.time() 
+
+
+cl <- makeCluster(no_cores, outfile = "/home/boole2/coursera/CapstonePrj/knbia.log")
+list.A.matrix <-parApply(cl, pointer ,1, FUN =  process_kneiser_inter_bia_fast_D, w1i.df = w1i.df, bi.gramma = bi.gramma,   uni.gram =  d.table.4.withstop,  v.discount.large,  V,bi.gramma.residuo = bi.gramma.residuo)
+stopCluster(cl)
+
+ proc.time() - ptm
+
+
+
+serialize.list <- function( l.list){
+  row.matrix <- matrix( ncol =  3,  nrow = 
+                          length(l.list) )
+  
+  for(i in 1: length(l.list)){
+  vec <- unlist(l.list[i] )
+   row.matrix[i,1] <- vec[1]
+   row.matrix[i,2] <- vec[2]
+   row.matrix[i,3] <- vec[3]
+   
+  }
+  return(row.matrix)
+}
+
+#si puo parallelizzare
+cl <- makeCluster(no_cores)
+dfs <- parLapply(cl, list.A.matrix, serialize.list ) 
+stopCluster(cl)
+
+
+
+
+# build.model.now <- function( dfs.list){
+#   model.bia <- as.data.frame( matrix( unlist ( dfs.list[1]), ncol = 3, byrow =F) )
+#   for( i in 2:length(dfs.list)){
+#     temp <- as.data.frame( matrix( unlist ( dfs.list[i]), ncol = 3, byrow =F) )
+#     model.bia <- rbind( model.bia, temp)
+#   }
+#   names( model.bia) <- c("predictor", "Pkn","outcome")
+#   model.bia$Pkn <- as.numeric( as.character ( model.bia$Pkn ) )
+#   return(model.bia)
+# }
+
+
+build.model.now <- function( dfs.list){
+  model.bia <- data.frame(do.call("rbind", dfs.list) )
+  names( model.bia) <- c("predictor", "Pkn","outcome")
+  model.bia$Pkn <- as.numeric( as.character ( model.bia$Pkn ) )
+  return(model.bia)
+}
+
+bigramma.kneiser.nay <- build.model.now(dfs)
+
+
+#write.csv(bigramma.kneiser.nay, file= "bi_kneiser_nay0001.csv",row.names=FALSE )
+
+#per aumentare il parallelismo va considerata la cardinalità dei biagramma (qui wi1) spezzando in chunk omogenei:
+# del tipo  e poi ricombinando con un rbind i vari chunk
+
+# chunk <- bi.gramma %>% group_by(predecessor) %>% summarize( count = n())
+#  chunk<- chunk[with(chunk, order(-count)),] 
+# dividendo in chunk progressivi 7 7*7, 7*7*7  e passando il chunk alla applyparallela.
+
+
+saveRDS(bigramma.kneiser.nay, file="../week5/bi_kneiser_nay0004.Rds")
+#test <- readRDS("../week5/bi_kneiser_nay0001.Rds")
+
+```
+
+
+
+## kneiser ney trigramma con D fisso all'ordine N model
+e gestione del UKN
+
+```{r fast.trigram.kneiser.ney.fix.D, cache= TRUE, echo= TRUE}
+
+### Ricalcoliamo qui l'unigramma e il bigramma e il trigramma e il four.gramma con il Discount 
+## (va calcolato il discount per ogni tipo di N-gramma.... o fisso (1=0.5,2=0.5,3=0.75..), o con la formuala dei tedeschi n1/n1+n2...).. da queste matrici si possono ricavare:
+# dal unigramma in colonna i Count Continuation e la Pkn (colonne sum e righe sum.. tutte per la normlaizzazione... questo solo una volta). dal unigramma, bigramma  le lambda (in sum in riga..).
+# la matrice del trigramma va bene così (per interpolazione - tri, bi, uni): a questo punto esplodendo:
+# Pkn(trigramma) = max( PMLN(wi|wi-1,wi-2) -discounted(wi,wi-1,wi-2) ) + d/count_bia(wi-1,wi-2) * C(wi-i,wi-2 *)  * Pkn(bia)
+# attenzione che  count_bia(wi-1,wi-2)  vuol dire per la frase "the tollest biliding" -> "wi-2, wi-2, wi"  quindi cont_bia("the tollest")  e non cont("tollest bilding") cosi anche C(wi-i,wi-2 *) è
+# C("the tollest *")   calcolato via biagramma rowsum >0  e il count_bia con la lookup della frequenza del biagramma "the tollest"
+## Proseguiamo con Pkn(biagramma) = max( Ckn( *wi,wi-1 )/CKn(*wi-i) -  discount(wi,wi-1)) + d/c(wi-1)  * C(wi-1*) * Pkn(wi)
+## Dove Ckn(*"tollest building" / Ckn(*"tollest"")) ricavata dalla matrice di continazione (biagramma.continuazione in colonna per il biagramma, e unigramma in sum colonna ). 
+## C(wi-1*) calcolabile dal unigramma ma in riga: sumrow(wi-1)> 0,  c(wi-1) e la frequenza del unigramma, diretto. 
+## Pkn(wi) = Ckn(*wi)/ V +  N1*percentuale_UKN (0.2)/V
+## dove Ckn(*wi)  ricavabile dal unigramma sommando in colonna > 0. V  è l'intero vocabolario.
+
+
+v.discount.large <- c(0.5, 0.5, rep(0.75, 1000) )
+
+
+# Next da modificare 27 dic. calcolare un data.frame di trigrammi, iternado direttamente sui trigrammi (non su una matrice)
+
+
+process_kneiser_interpolation_fast_D <- function(i, w2iw1i.df, bi.gramma, tri.gramma,  uni.gram, bi.gram,v.discount,  V, bi.gramma.residuo ){ 
+  
+    # da cambiare passando direttamente w2w1 (unici quidni estrarre un 
+        #df  <- as.data.frame (unique(tri.gramma$predecessore))
+        # C.continuation.wi2wi1.p <-  nrow( tri.gramma[tri.gramma$predecessor ==  w2w1,])
+  
+  A.list = list()
+   ## prendo l'indice dalla riga vettore = a row del df. trigramma
+  wi2wi1 <- as.character( w2iw1i.df[i])
+  
+   if(  runif(1) > 0.98 ) {
+     message(paste("pointer = ",i ) )
+     message(paste("wi1 = ", wi2wi1 ) )
+     flush.console()
+   }
+ 
+  
+ 
+  #  A.list[[1]] <-  wi2wi1
+  x <- unlist ( strsplit(wi2wi1, " ", fixed=TRUE)  )
+  wi2 <-  x[1]
+  wi1 <- x[2]
+  
+  list.of.predittori <- tri.gramma[ tri.gramma$predecessor == wi2wi1,  ]
+  C.continuation.wi2wi1.p <-  nrow( list.of.predittori) 
+  
+  c.wi2wi1.gram <- bi.gram[bi.gram$words == wi2wi1, ]$N
+  
+  # Per ogni tupla (tri.gramma) wi2wi1wi  dove wi cambia ad ogni ciclo calcolo le probabilità (come assembato di array nella lista di ritorno)
+  # Nota D è qui fissato all'ordine più alto non nullo del modello - quindi D(tri.gramma) che cambia ad ogni ciclo wi2wi1 +(wi) 
+  
+  if( C.continuation.wi2wi1.p  >0){
+    
+    for(i in 1:nrow(list.of.predittori)){
+      A.row <- array(data = c(wi2wi1, "0","null"), dim =3)
+      wi <-  as.character(  list.of.predittori[i,]$successor)
+      A.row[1] <-  wi2wi1
+      A.row[3] <- wi
+      
+      wi2wi1wi.freq <- list.of.predittori[i,]$freq
+      
+      D <- v.discount[wi2wi1wi.freq +1] 
+      
+      smooted.wi2wi1wi <- wi2wi1wi.freq -   D     
+      
+      P.MLE.wiwi1wi2.dis <-   smooted.wi2wi1wi / c.wi2wi1.gram
+      ### lambda 
+      
+      lambda_wi2wi1 <- ( D/c.wi2wi1.gram )*C.continuation.wi2wi1.p
+  
+      
+      wi1.wi <- paste(wi1,wi)
+      ### Pkn(wi1)
+      
+      
+      Max.wi1.wi.d <- 0
+      # da cambiare usando il tri.gramma splittato predecessore wi2   successore wi1wi e 
+      # filtrando sulla colonna successore con  nrow si ottinene Ckn.p.wi1.wi
+      
+      Ckn.p.wi1.wi  <- nrow(  bi.gramma.residuo[ bi.gramma.residuo$successor == wi1.wi,  ] )
+      
+    #  bia.cont.row <- biagramma.continuation[ , c( which( names(biagramma.continuation) == wi1.wi) )]
+      #if( Ckn.p.wi1.wi > 0 ){
+       
+        
+        #uso il bia.gramma splittato wi1   wi  ma considerando qui wi <- wi1 
+        # quindi si filtra su successore considerando wi == wi1 
+        # nrow riporta Ckn.p.wi1 
+        Ckn.p.wi1 <- nrow( bi.gramma[bi.gramma$successor == wi1,  ])
+        Max.wi1.wi.d <- (Ckn.p.wi1.wi - D)/Ckn.p.wi1
+      #}
+        if(Max.wi1.wi.d <0  ) Max.wi1.wi.d <- 0 
+      
+      c.wi1 <- uni.gram[uni.gram$words == wi1,]$N
+      
+      # uso bi.gramma splittato wi1  wi filtrando su colonna predecessore con wi1
+      # nrow corrisponde a C.continuation.wi1.p.. (attenzione a non contare gli <s>, </s>)
+      # controllare con doppio calcolo?
+      C.continuation.wi1.p <- nrow( bi.gramma[bi.gramma$predecessor == wi1,  ])
+      
+      lambda_wi1 <- (  D/ c.wi1) *  C.continuation.wi1.p
+      ## Pkn(wi)
+      
+      ## uso bi.gramma wi1 wi  filtrare su wi successore e calcolare nrow
+      # si ottine Ckn.p.wi - controllare con doppio calcolo
+      Ckn.p.wi <- nrow(bi.gramma[bi.gramma$successor == wi, ])
+      
+      Pkn.wi <- (Ckn.p.wi/V)
+      if( wi == "<UNK>") Pkn.wi <- 0.0001/V # riduco a epsilon la probabilità del unigramma Dummy
+      
+      Pkn.wi1.wi.d <- Max.wi1.wi.d + lambda_wi1 * Pkn.wi
+      Pkn.wi2.wi1.wi.d <- P.MLE.wiwi1wi2.dis + lambda_wi2wi1 * Pkn.wi1.wi.d
+      #+ ((N1*perc.cut) /V)
+      
+      A.row[2] <- as.character( Pkn.wi2.wi1.wi.d)
+      # A.row[2] <- paste( paste( paste( paste( paste( paste( 
+      #             paste ( paste( paste("wi2wi1 =", wi2wi1 ), "wi =",wi), "Pkn.wi2.wi1.wi.d =", Pkn.wi2.wi1.wi.d),
+      #             "Pkn.wi = ", Pkn.wi),
+      #              "lambda_wi1 =", lambda_wi1),
+      #               "Max.wi1.wi.d =", Max.wi1.wi.d),
+      #                "P.MLE.wiwi1wi2.dis", P.MLE.wiwi1wi2.dis),
+      #             "Ckn.p.wi1.wi = ",Ckn.p.wi1.wi),
+      #             "Ckn.p.wi1 =", Ckn.p.wi1)
+                        
+      A.list[[i]] <-A.row
+      #  A.matrix[i-1] <- paste ( paste( paste("wi2wi1 =", wi2wi1 ), "wi =",wi), "Pkn.wi2.wi1.wi.d =", Pkn.wi2.wi1.wi.d)
+    }
+  }else{
+    
+    A.row <- array(data = c(wi2wi1, "0","null"), dim =3)
+    A.list[[1]] <-A.row
+  }
+  
+  
+  
+  return(A.list)
+}
+
+
+
+
+bi.gram$N <- as.numeric(bi.gram$N)
+tri.gram$N <- as.numeric(tri.gram$N)
+ 
+# w2iw1i.df <- as.data.frame(  unique(tri.gramma$predecessor))
+# names(w2iw1i.df) <- c("index")
+# nrow(w2iw1i.df)
+# w2iw1i.df <- as.data.frame ( w2iw1i.df[ which( w2iw1i.df$index != c("<s> <s>") ) , ])
+# names(w2iw1i.df) <- c("index")
+
+
+chunk <- tri.gramma %>% group_by(predecessor) %>% summarize( count = n())
+chunk<- chunk[with(chunk, order(-count)),] 
+chunk <- chunk[-c(1),]
+ 
+w2iw1i.df <-  as.array( chunk$predecessor)
+#names(w1i.df) <- c("index")
+pointer  <-  as.array(1:length(w2iw1i.df))
+
+
+
+cl <- makeCluster(no_cores, outfile = "/home/boole2/coursera/CapstonePrj/kntri.log")
+list.A.matrix <-parApply(cl, pointer ,1, FUN =  process_kneiser_interpolation_fast_D,  w2iw1i.df = w2iw1i.df, bi.gramma = bi.gramma, tri.gramma = tri.gramma,  uni.gram =  d.table.4.withstop, bi.gram, v.discount.large,  V,bi.gramma.residuo = bi.gramma.residuo )
+stopCluster(cl)
+
+
+
+
+serialize.list <- function( l.list){
+  row.matrix <- matrix( ncol =  3,  nrow = 
+                          length(l.list) )
+  
+  for(i in 1: length(l.list)){
+  vec <- unlist(l.list[i] )
+   row.matrix[i,1] <- vec[1]
+   row.matrix[i,2] <- vec[2]
+   row.matrix[i,3] <- vec[3]
+   
+  }
+  return(row.matrix)
+}
+
+#si puo parallelizzare
+cl <- makeCluster(no_cores)
+dfs <- parLapply(cl, list.A.matrix, serialize.list ) 
+stopCluster(cl)
+
+
+
+
+# build.model.now <- function( dfs.list){
+#   model.bia <- as.data.frame( matrix( unlist ( dfs.list[1]), ncol = 3, byrow =F) )
+#   for( i in 2:length(dfs.list)){
+#     temp <- as.data.frame( matrix( unlist ( dfs.list[i]), ncol = 3, byrow =F) )
+#     model.bia <- rbind( model.bia, temp)
+#   }
+#   names( model.bia) <- c("predictor", "Pkn","outcome")
+#   model.bia$Pkn <- as.numeric( as.character ( model.bia$Pkn ) )
+#   return(model.bia)
+# }
+# 
+# 
+# triagramma.kneiser.nay<- build.model.now(dfs)
+# ####################################################
+
+build.model.now <- function( dfs.list){
+  model.bia <- data.frame(do.call("rbind", dfs.list) )
+  names( model.bia) <- c("predictor", "Pkn","outcome")
+  model.bia$Pkn <- as.numeric( as.character ( model.bia$Pkn ) )
+  return(model.bia)
+}
+
+
+
+ 
+triagramma.kneiser.nay<- build.model.now(dfs)
+
+
+
+# tky <- triagramma.kneiser.nay[triagramma.kneiser.nay$predictor == "<s> who", ]
+# ss <- bi.gram[bi.gram$words == "stayed for", ]
+# 
+# confronto <- read.csv("tri_kneiser_nay.csv")
+# rr <- confronto[confronto$index == "i looked at", ]
+
+#write.csv(triagramma.kneiser.nay, file= "tri_kneiser_nay6.csv",row.names=FALSE )
+
+saveRDS(triagramma.kneiser.nay, file="../week5/tri_kneiser_nay0004.Rds")
+
+```
+
+
+
+## Four Gramma kneiser Ney
+
+
+```{r fast.fourgram.kneiser.ney, cache= TRUE, echo= TRUE}
+
+### calcolo per Pkn (wi | wi-1,wi-2, wi-3) 
+
+
+v.discount.large <- c(0.5, 0.5, rep(0.75, 1000) )
+
+#**
+# v.discount <- v.discount.large
+# 
+# uni.gram <- d.table.4.withstop
+
+# index modificato ora contiene wi3wi2wi1 predecessori unici del wi estratti dal quattro.gramma
+
+process_kneiser_inter_fourg_fast <- function(i, w3iw2iw1i.df, bi.gramma, tri.gramma,  uni.gram, bi.gram, v.discount,
+                                             V, bi.gramma.residuo, 
+                                             quattro.gramma, tri.gramma.residuo ){ 
+  
+    # da cambiare passando direttamente w2w1 (unici quidni estrarre un 
+        #df  <- as.data.frame (unique(tri.gramma$predecessore))
+        # C.continuation.wi2wi1.p <-  nrow( tri.gramma[tri.gramma$predecessor ==  w2w1,])
+  
+  A.list = list()
+  ## prendo l'indice dalla riga vettore = a row del df. trigramma
+ 
+  wi3wi2wi1 <- as.character( w3iw2iw1i.df[i])
+  
+  if(  runif(1) > 0.98 ) {
+     message(paste("pointer = ",i ) )
+     message(paste("wi1 = ", wi3wi2wi1 ) )
+     flush.console()
+   }
+  
+  x <- unlist ( strsplit(wi3wi2wi1, " ", fixed=TRUE)  )
+  
+  wi3 <-  x[1]
+  wi2 <- x[2]
+  wi1 <- x[3]
+ 
+   list.of.predittori.four.g <- quattro.gramma[ quattro.gramma$predecessor == wi3wi2wi1,  ]
+  C.continuation.wi3wi2wi1.p <-  nrow( list.of.predittori.four.g)  
+  
+  
+  
+  c.wi3wi2wi1.gram <- tri.gramma[tri.gramma$trigramma == wi3wi2wi1, ]$freq
+  # verificare se v.discount deve essere riferito al freq del trigramma o al freq del four gramma originale...?
+  # si D al primo ordine superiore non nullo (è il discount assoluto da trasferire verso il basso N-1..nel interpolazione).
+  #nota che qui però calcoliamo n four gramma  tri + wi trovata  quindi n D diverse in base alle
+  # frequenze   di quatto.gramma$foursgramma == wi3wi2wi1+ wi  freq. (mente adesso il trigramma è definito...)
+  # qui N =4 troviamo sempre almeno un four.gramma  wi3wi2wi1+ wi  in quanto iteriamo sul trigramma predecessore dei quatto.gramma.
+  
+  #lambda_wi3wi2wi1 <- ( v.discount[c.wi3wi2wi1.gram +1]/c.wi3wi2wi1.gram )*C.continuation.wi3wi2wi1.p
+  
+    if( C.continuation.wi3wi2wi1.p  >0){
+    
+    for(i in 1:nrow(list.of.predittori.four.g)){
+ #**         
+#i = 1              
+      A.row <- array(data = c(wi3wi2wi1, "0","null"), dim =3)
+      wi <-  as.character(  list.of.predittori.four.g[i,]$successor)
+      
+      A.row[1] <-  wi3wi2wi1
+      A.row[3] <- wi
+      
+      wi3wi2wi1wi.freq <- list.of.predittori.four.g[i,]$freq
+      
+      D = v.discount[wi3wi2wi1wi.freq +1]  #  D discount viene fissata qui per tutto il calcolo d'interpolazioneper questa tupla - four.gramma wi3wi2wi1wi
+      
+      smooted.wi3wi2wi1wi <- wi3wi2wi1wi.freq - D    
+      
+      P.MLE.wi3wi2wi1wi.dis <-   smooted.wi3wi2wi1wi / c.wi3wi2wi1.gram
+     
+      
+      ### Lamdba lambda_wi3wi2wi1
+      lambda_wi3wi2wi1 <- ( D /c.wi3wi2wi1.gram )*C.continuation.wi3wi2wi1.p
+      
+    #######################################################################################
+    ######################trigramma Pkn(wi|wi-1 wi-2) ma qui bisogna usare i Ckn (e non P_MLE per il trigramma)
+  
+      # Lambda lambda_wi2wi1
+  wi2.wi1 <- paste(wi2,wi1)
+      
+  list.of.predittori <- tri.gramma[ tri.gramma$predecessor == wi2.wi1,  ]
+      
+  C.continuation.wi2wi1.p <-  nrow( list.of.predittori)   
+  
+  c.wi2wi1.gram <- bi.gram[bi.gram$words == wi2.wi1, ]$N
+  
+  lambda_wi2wi1 <- ( D/c.wi2wi1.gram )*C.continuation.wi2wi1.p
+  
+  ###############MAx Max.wi2wi1wi.dis
+  wi2wi1wi <- paste(wi2.wi1, wi)
+      
+      Ckn.p.wi2wi1wi  <- nrow( tri.gramma.residuo[tri.gramma.residuo$successor == wi2wi1wi,])
+      
+      smooted.wi2wi1wi <- Ckn.p.wi2wi1wi -  D  
+      
+      Ckn.p.wi2wi1 <- nrow(bi.gramma.residuo[bi.gramma.residuo$successor == wi2.wi1,])
+      
+      Max.wi2wi1wi.dis <-   smooted.wi2wi1wi / Ckn.p.wi2wi1
+      if( Max.wi2wi1wi.dis < 0)  Max.wi2wi1wi.dis <-0
+    ####################à  
+      
+      wi1.wi <- paste(wi1,wi)
+      ### Pkn(wi1)
+      
+      
+      Max.wi1.wi.d <- 0
+      # uso il tri.gramma splittato predecessore wi2   successore wi1wi e 
+      #
+      # filtrando sulla colonna successore con  nrow si ottinene Ckn.p.wi1.wi
+      
+      Ckn.p.wi1.wi  <- nrow(  bi.gramma.residuo[ bi.gramma.residuo$successor == wi1.wi,  ] )
+      
+    #  bia.cont.row <- biagramma.continuation[ , c( which( names(biagramma.continuation) == wi1.wi) )]
+     # if( Ckn.p.wi1.wi > 0 ){
+       
+        
+        # da combiare usando il bia.gramma splittato wi1   wi  ma considerando qui wi <- wi1 
+        # quindi si filtra su successore considerando wi == wi1 
+        # nrow riporta Ckn.p.wi1 
+        Ckn.p.wi1 <- nrow( bi.gramma[bi.gramma$successor == wi1,  ])
+        Max.wi1.wi.d <- (Ckn.p.wi1.wi - D)/Ckn.p.wi1
+      #}
+      if( Max.wi1.wi.d <0  ) Max.wi1.wi.d <-0
+        
+      c.wi1 <- uni.gram[uni.gram$words == wi1,]$N
+      
+      # da cambiare in bi.gramma splittato wi1  wi filtrando su colonna predecessore con wi1
+      # nrow corrisponde a C.continuation.wi1.p.. (attenzione a non contare gli <s>, </s>)
+      # controllare con doppio calcolo?
+      C.continuation.wi1.p <- nrow( bi.gramma[bi.gramma$predecessor == wi1,  ])
+      
+      lambda_wi1 <- (  D/ c.wi1) *  C.continuation.wi1.p
+      ## Pkn(wi)
+      
+      ## da cambiare da bi.gramma wi1 wi  filtrare su wi successore e calcolare nrow
+      # si ottine Ckn.p.wi - controllare con doppio calcolo
+      Ckn.p.wi <- nrow(bi.gramma[bi.gramma$successor == wi, ])
+      Pkn.wi <- (Ckn.p.wi/V)
+      
+      if( wi == "<UNK>") Pkn.wi <- 0.0001/V 
+      
+      Pkn.wi1.wi.d <- Max.wi1.wi.d + lambda_wi1 * Pkn.wi
+      Pkn.wi2.wi1.wi.d <- Max.wi2wi1wi.dis + lambda_wi2wi1 * Pkn.wi1.wi.d
+      
+       Pkn.wi3.wi2.wi1.wi.d <- P.MLE.wi3wi2wi1wi.dis + lambda_wi3wi2wi1 * Pkn.wi2.wi1.wi.d
+      #+ ((N1*perc.cut) /V)
+      
+      A.row[2] <- as.character( Pkn.wi3.wi2.wi1.wi.d)
+                       
+      A.list[[i]] <-A.row
+     
+    }
+  }else{
+    
+    A.row <- array(data = c(wi3wi2wi1, "0","null"), dim =3)
+    A.list[[1]] <-A.row
+  }
+
+  return(A.list)
+}
+
+
+
+
+bi.gram$N <- as.numeric(bi.gram$N)
+tri.gram$N <- as.numeric(tri.gram$N)
+tri.gramma$freq <- as.numeric(tri.gramma$freq)
+tri.gramma.residuo$freq <- as.numeric( tri.gramma.residuo$freq)
+ 
+# w3iw2iw1i.df <- as.data.frame(  unique(quattro.gramma$predecessor))
+# names(w3iw2iw1i.df) <- c("index")
+# nrow(w3iw2iw1i.df)
+# w3iw2iw1i.df <- as.data.frame ( w3iw2iw1i.df[ which( w3iw2iw1i.df$index != c("<s> <s> <s>") ) , ])
+# names(w3iw2iw1i.df) <- c("index")
+
+
+chunk <- quattro.gramma %>% group_by(predecessor) %>% summarize( count = n())
+chunk<- chunk[with(chunk, order(-count)),] 
+chunk <- chunk[-c(1),]
+ 
+w3iw2iw1i.df <-  as.array( chunk$predecessor)
+#names(w1i.df) <- c("index")
+pointer  <-  as.array(1:length(w3iw2iw1i.df))
+
+
+
+cl <- makeCluster(no_cores, outfile = "/home/boole2/coursera/CapstonePrj/knfour.log")
+list.A.matrix <-parApply(cl, pointer ,1, FUN =  process_kneiser_inter_fourg_fast, w3iw2iw1i.df = w3iw2iw1i.df, bi.gramma = bi.gramma, tri.gramma = tri.gramma,  uni.gram =  d.table.4.withstop, bi.gram, v.discount.large,  V,bi.gramma.residuo = bi.gramma.residuo, quattro.gramma = quattro.gramma, tri.gramma.residuo = tri.gramma.residuo )
+stopCluster(cl)
+
+
+
+
+serialize.list <- function( l.list){
+  row.matrix <- matrix( ncol =  3,  nrow = 
+                          length(l.list) )
+  
+  for(i in 1: length(l.list)){
+  vec <- unlist(l.list[i] )
+   row.matrix[i,1] <- vec[1]
+   row.matrix[i,2] <- vec[2]
+   row.matrix[i,3] <- vec[3]
+   
+  }
+  return(row.matrix)
+}
+
+#si puo parallelizzare
+cl <- makeCluster(no_cores)
+dfs <- parLapply(cl, list.A.matrix, serialize.list ) 
+stopCluster(cl)
+
+
+
+
+build.model.now <- function( dfs.list){
+  model.bia <- data.frame(do.call("rbind", dfs.list) )
+  names( model.bia) <- c("predictor", "Pkn","outcome")
+  model.bia$Pkn <- as.numeric( as.character ( model.bia$Pkn ) )
+  return(model.bia)
+}
+
+fourgramma.kneiser.nay<- build.model.now(dfs)
+
+
+#write.csv(fourgramma.kneiser.nay, file= "four_kneiser_nay.csv",row.names=FALSE )
+saveRDS(fourgramma.kneiser.nay, file="../week5/four_kneiser_nay0004.Rds")
+
+```
+
+# Review K. Ney Faster
+
+```{r flatten.fourgram.kneiser.ney, cache= TRUE, echo= TRUE}
+
+### calcolo per Pkn (wi | wi-1,wi-2, wi-3) 
+
+
+v.discount.large <- c(0.5, 0.5, rep(0.75, 1000) )
+
+# #**
+# v.discount <- v.discount.large
+# 
+# uni.gram <- d.table.4.withstop
+
+
+
+process_kneiser_inter_fourg_fast <- function(i, w3iw2iw1i.df, bi.gramma, tri.gramma,  uni.gram, bi.gram, v.discount,
+                                             V, bi.gramma.residuo, 
+                                             quattro.gramma, tri.gramma.residuo ){ 
+ 
+  wi3wi2wi1 <- as.character( w3iw2iw1i.df[i])
+  wi <- as.character( quattro.gramma[i,]$successor)
+  
+  if(  runif(1) > 0.99 ) {
+     message(paste("pointer = ",i ) )
+     message(paste("wi3wi2wi1 = ", wi3wi2wi1 ) )
+     message(paste("wi = ", wi ) )
+     flush.console()
+   }
+  
+  x <- unlist ( strsplit(wi3wi2wi1, " ", fixed=TRUE)  )
+  
+  wi3 <-  x[1]
+  wi2 <- x[2]
+  wi1 <- x[3]
+ 
+
+  C.continuation.wi3wi2wi1.p <-  nrow( quattro.gramma[ quattro.gramma$predecessor == wi3wi2wi1,  ])  
+  
+  c.wi3wi2wi1.gram <- tri.gramma[tri.gramma$trigramma == wi3wi2wi1, ]$freq
+  
+  
+      wi3wi2wi1wi.freq <- quattro.gramma[i,]$freq
+      
+      D = v.discount[wi3wi2wi1wi.freq +1]  #  D discount viene fissata qui per tutto il calcolo d'interpolazioneper questa tupla - four.gramma wi3wi2wi1wi
+      
+      smooted.wi3wi2wi1wi <- wi3wi2wi1wi.freq - D    
+      
+      P.MLE.wi3wi2wi1wi.dis <-   smooted.wi3wi2wi1wi / c.wi3wi2wi1.gram
+     
+      
+      ### Lamdba lambda_wi3wi2wi1
+      lambda_wi3wi2wi1 <- ( D /c.wi3wi2wi1.gram )*C.continuation.wi3wi2wi1.p
+      
+    #######################################################################################
+    ######################trigramma Pkn(wi|wi-1 wi-2) ma qui bisogna usare i Ckn (e non P_MLE per il trigramma)
+  
+      # Lambda lambda_wi2wi1
+  wi2.wi1 <- paste(wi2,wi1)
+      
+  list.of.predittori <- tri.gramma[ tri.gramma$predecessor == wi2.wi1,  ]
+      
+  C.continuation.wi2wi1.p <-  nrow( list.of.predittori)   
+  
+  c.wi2wi1.gram <- bi.gram[bi.gram$words == wi2.wi1, ]$N
+  
+  lambda_wi2wi1 <- ( D/c.wi2wi1.gram )*C.continuation.wi2wi1.p
+  
+  ###############MAx Max.wi2wi1wi.dis
+  wi2wi1wi <- paste(wi2.wi1, wi)
+      
+      Ckn.p.wi2wi1wi  <- nrow( tri.gramma.residuo[tri.gramma.residuo$successor == wi2wi1wi,])
+      
+      smooted.wi2wi1wi <- Ckn.p.wi2wi1wi -  D  
+      
+      Ckn.p.wi2wi1 <- nrow(bi.gramma.residuo[bi.gramma.residuo$successor == wi2.wi1,])
+      
+      Max.wi2wi1wi.dis <-   smooted.wi2wi1wi / Ckn.p.wi2wi1
+      if( Max.wi2wi1wi.dis < 0)  Max.wi2wi1wi.dis <-0
+    
+      wi1.wi <- paste(wi1,wi)
+      ### Pkn(wi1)
+      
+      
+      Max.wi1.wi.d <- 0
+      # uso il tri.gramma splittato predecessore wi2   successore wi1wi e 
+      #
+      # filtrando sulla colonna successore con  nrow si ottinene Ckn.p.wi1.wi
+      
+      Ckn.p.wi1.wi  <- nrow(  bi.gramma.residuo[ bi.gramma.residuo$successor == wi1.wi,  ] )
+      
+      
+        Ckn.p.wi1 <- nrow( bi.gramma[bi.gramma$successor == wi1,  ])
+        Max.wi1.wi.d <- (Ckn.p.wi1.wi - D)/Ckn.p.wi1
+     
+      if( Max.wi1.wi.d <0  ) Max.wi1.wi.d <-0
+        
+      c.wi1 <- uni.gram[uni.gram$words == wi1,]$N
+      
+      C.continuation.wi1.p <- nrow( bi.gramma[bi.gramma$predecessor == wi1,  ])
+      
+      lambda_wi1 <- (  D/ c.wi1) *  C.continuation.wi1.p
+      ## Pkn(wi)
+      
+      ## da cambiare da bi.gramma wi1 wi  filtrare su wi successore e calcolare nrow
+      # si ottine Ckn.p.wi - controllare con doppio calcolo
+      Ckn.p.wi <- nrow(bi.gramma[bi.gramma$successor == wi, ])
+      Pkn.wi <- (Ckn.p.wi/V)
+      
+      if( wi == "<UNK>") Pkn.wi <- 0.0001/V 
+      
+      Pkn.wi1.wi.d <- Max.wi1.wi.d + lambda_wi1 * Pkn.wi
+      Pkn.wi2.wi1.wi.d <- Max.wi2wi1wi.dis + lambda_wi2wi1 * Pkn.wi1.wi.d
+      
+       Pkn.wi3.wi2.wi1.wi.d <- P.MLE.wi3wi2wi1wi.dis + lambda_wi3wi2wi1 * Pkn.wi2.wi1.wi.d
+      
+   
+
+  return(list(wi3wi2wi1, Pkn.wi3.wi2.wi1.wi.d, wi ))
+}
+
+
+
+
+bi.gram$N <- as.numeric(bi.gram$N)
+tri.gram$N <- as.numeric(tri.gram$N)
+tri.gramma$freq <- as.numeric(tri.gramma$freq)
+tri.gramma.residuo$freq <- as.numeric( tri.gramma.residuo$freq)
+ 
+
+ 
+quattro.gramma <- quattro.gramma[quattro.gramma$predecessor != "<s> <s> <s>",  ]
+
+w3iw2iw1i.df <-  as.array( quattro.gramma$predecessor)
+
+pointer  <-  as.array(1:length(w3iw2iw1i.df))
+
+
+# fletten pointer
+cl <- makeCluster(no_cores, outfile = "/home/boole2/coursera/CapstonePrj/knfour.log")
+res <-parApply(cl, pointer ,1, FUN =  process_kneiser_inter_fourg_fast, w3iw2iw1i.df = w3iw2iw1i.df, bi.gramma = bi.gramma, tri.gramma = tri.gramma,  uni.gram =  d.table.4.withstop, bi.gram, v.discount.large,  V,bi.gramma.residuo = bi.gramma.residuo, quattro.gramma = quattro.gramma, tri.gramma.residuo = tri.gramma.residuo )
+stopCluster(cl)
+
+
+cl <- makeCluster(no_cores)
+ x2 =  parLapply(cl, res, function(l) l[c(1,2,3)])
+stopCluster(cl)
+
+fourgramma.kneiser.nay <- data.frame( matrix(unlist(x2), ncol = 3, byrow = TRUE) )
+names(fourgramma.kneiser.nay) <-   c("predictor", "Pkn","outcome")
+
+
+
+
+ fourgramma.kneiser.nay$Pkn <- as.numeric( as.character ( fourgramma.kneiser.nay$Pkn ) )
+
+
+
+#write.csv(fourgramma.kneiser.nay, file= "four_kneiser_nay.csv",row.names=FALSE )
+saveRDS(fourgramma.kneiser.nay, file="../week5/four_kneiser_nay002.Rds")
+
+```
+
+
+
+
+
+
+
+
+
+
